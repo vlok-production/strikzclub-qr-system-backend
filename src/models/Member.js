@@ -12,12 +12,29 @@ const memberSchema = new mongoose.Schema(
       required: true,
       trim: true,
     },
-    membershipDay: {
+    membershipType: {
       type: String,
       required: true,
       lowercase: true,
       trim: true,
+      enum: ['weekday', 'weekly', 'premium'],
+      default: 'weekday',
+    },
+    membershipDay: {
+      type: String,
+      required: function requiredMembershipDay() {
+        return this.membershipType === 'weekday';
+      },
+      lowercase: true,
+      trim: true,
       enum: ['sunday', 'monday', 'tuesday', 'wednesday', 'thursday', 'friday', 'saturday'],
+      default: null,
+    },
+    serialNumber: {
+      type: String,
+      required: true,
+      unique: true,
+      index: true,
     },
     qrToken: {
       type: String,

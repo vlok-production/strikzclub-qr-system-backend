@@ -3,12 +3,13 @@ const mongoose = require('mongoose');
 const dotenv = require('dotenv');
 
 const Attendance = require('./models/Attendance');
+const Counter = require('./models/Counter');
 const Member = require('./models/Member');
 const { createQrToken, getConfiguredAdmin, issueAdminToken, safeEqual, verifyToken } = require('./utils/auth');
 const {
   WEEKDAY_NAMES,
   getStatusMessage,
-  isScheduledToday,
+  isMemberAllowedToday,
   normalizeMembershipDay,
   serializeMember,
   startOfDay,
@@ -40,9 +41,14 @@ function sendError(res, status, message) {
   return res.status(status).json({ message });
 }
 
+function normalizeMembershipType(value) {
+  return `${value || 'weekday'}`.trim().toLowerCase();
+}
+
 function validateMemberPayload(payload) {
   const fullName = `${payload.fullName || ''}`.trim();
   const phone = `${payload.phone || ''}`.trim();
+  const membershipType = normalizeMembershipType(payload.membershipType);
   const membershipDay = normalizeMembershipDay(payload.membershipDay);
 
   if (!fullName) {
@@ -53,11 +59,25 @@ function validateMemberPayload(payload) {
     return 'Phone is required';
   }
 
-  if (!WEEKDAY_NAMES.includes(membershipDay)) {
+  if (!['weekday', 'weekly', 'premium'].includes(membershipType)) {
+    return 'Membership type must be weekday, weekly, or premium';
+  }
+
+  if (membershipType === 'weekday' && !WEEKDAY_NAMES.includes(membershipDay)) {
     return 'Membership day must be a valid weekday';
   }
 
   return null;
+}
+
+async function getNextSerialNumber() {
+  const counter = await Counter.findOneAndUpdate(
+    { key: 'memberSerialNumber' },
+    { $inc: { value: 1 } },
+    { new: true, upsert: true, setDefaultsOnInsert: true },
+  );
+
+  return `STRIKZ-${String(counter.value).padStart(5, '0')}`;
 }
 
 async function requireAdmin(req, res, next) {
@@ -146,10 +166,13 @@ app.post('/api/members', requireAdmin, async (req, res, next) => {
       return sendError(res, 400, validationError);
     }
 
+    const membershipType = normalizeMembershipType(req.body.membershipType);
     const member = await Member.create({
       fullName: req.body.fullName.trim(),
       phone: req.body.phone.trim(),
-      membershipDay: normalizeMembershipDay(req.body.membershipDay),
+      membershipType,
+      membershipDay: membershipType === 'weekday' ? normalizeMembershipDay(req.body.membershipDay) : null,
+      serialNumber: await getNextSerialNumber(),
       qrToken: createQrToken(),
       status: 'active',
       missedWeekStreak: 0,
@@ -175,6 +198,7 @@ app.patch('/api/members/:id', requireAdmin, async (req, res, next) => {
     const validationError = validateMemberPayload({
       fullName: req.body.fullName ?? member.fullName,
       phone: req.body.phone ?? member.phone,
+      membershipType: req.body.membershipType ?? member.membershipType,
       membershipDay: req.body.membershipDay ?? member.membershipDay,
     });
 
@@ -184,7 +208,9 @@ app.patch('/api/members/:id', requireAdmin, async (req, res, next) => {
 
     member.fullName = (req.body.fullName ?? member.fullName).trim();
     member.phone = (req.body.phone ?? member.phone).trim();
-    member.membershipDay = normalizeMembershipDay(req.body.membershipDay ?? member.membershipDay);
+    member.membershipType = normalizeMembershipType(req.body.membershipType ?? member.membershipType);
+    member.membershipDay =
+      member.membershipType === 'weekday' ? normalizeMembershipDay(req.body.membershipDay ?? member.membershipDay) : null;
 
     if (req.body.status === 'active') {
       member.status = 'active';
@@ -202,6 +228,47 @@ app.patch('/api/members/:id', requireAdmin, async (req, res, next) => {
     return res.json({
       member: serializeMember(member),
       message: 'Member updated successfully',
+    });
+  } catch (error) {
+    return next(error);
+  }
+});
+
+app.post('/api/members/:id/renew', requireAdmin, async (req, res, next) => {
+  try {
+    const member = await Member.findById(req.params.id);
+
+    if (!member) {
+      return sendError(res, 404, 'Member not found');
+    }
+
+    member.status = 'active';
+    member.missedWeekStreak = 0;
+    member.reactivatedAt = new Date();
+    await member.save();
+
+    return res.json({
+      member: serializeMember(member),
+      message: 'Member renewed successfully',
+    });
+  } catch (error) {
+    return next(error);
+  }
+});
+
+app.delete('/api/members/:id', requireAdmin, async (req, res, next) => {
+  try {
+    const member = await Member.findById(req.params.id);
+
+    if (!member) {
+      return sendError(res, 404, 'Member not found');
+    }
+
+    await Attendance.deleteMany({ memberId: member._id });
+    await Member.deleteOne({ _id: member._id });
+
+    return res.json({
+      message: 'Member deleted successfully',
     });
   } catch (error) {
     return next(error);
@@ -228,7 +295,7 @@ app.post('/api/scan/verify', async (req, res, next) => {
 
     await syncMemberStatus(member, Attendance);
 
-    const scheduledToday = isScheduledToday(member.membershipDay);
+    const allowedToday = isMemberAllowedToday(member);
     const memberPayload = serializeMember(member, { includeQrToken: false });
 
     if (member.status === 'invalid') {
@@ -236,16 +303,16 @@ app.post('/api/scan/verify', async (req, res, next) => {
         isValid: false,
         attendanceMarked: false,
         member: memberPayload,
-        message: getStatusMessage(member.status, member.membershipDay, scheduledToday),
+        message: getStatusMessage(member, allowedToday),
       });
     }
 
-    if (!scheduledToday) {
+    if (!allowedToday) {
       return res.json({
         isValid: false,
         attendanceMarked: false,
         member: memberPayload,
-        message: getStatusMessage(member.status, member.membershipDay, scheduledToday),
+        message: getStatusMessage(member, allowedToday),
       });
     }
 
@@ -261,7 +328,7 @@ app.post('/api/scan/verify', async (req, res, next) => {
         await Attendance.create({
           memberId: member._id,
           visitedAt: new Date(),
-          scheduledDay: member.membershipDay,
+          scheduledDay: member.membershipType === 'weekday' ? member.membershipDay : WEEKDAY_NAMES[new Date().getDay()],
           sessionDate,
         });
         attendanceMarked = true;
