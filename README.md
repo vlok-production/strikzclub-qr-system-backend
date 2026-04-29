@@ -1,0 +1,1 @@
+# strikzclub-qr-system-backend
